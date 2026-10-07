@@ -42,8 +42,122 @@ jobs:
           retention-days: 1
 
   # =========================================================================
+  # FASE 2: SAST - SEMGREP (TP15)
+  # =========================================================================
+  semgrep-sast-scan:
+    name: "Fase 2: Semgrep SAST"
+    runs-on: ubuntu-latest
+    needs: [build-and-package]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout del código
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar Semgrep
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      - name: Instalar jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Ejecutar Semgrep SAST
+        run: |
+          semgrep scan             --config=p/owasp-top-ten             --config=p/python             --config=p/dockerfile             --config=p/kubernetes             --config=p/terraform             --json             --output=semgrep-report.json             devops-tp12/app devops-tp12/chart devops-tp12
+
+      - name: Resumen de resultados Semgrep
+        if: always()
+        run: |
+          echo "### Auditoría SAST - Semgrep :mag:" >> $GITHUB_STEP_SUMMARY
+          echo "| Métrica | Resultado |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Findings | $(jq '.results | length' semgrep-report.json 2>/dev/null || echo 0) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Motor | Semgrep SAST |" >> $GITHUB_STEP_SUMMARY
+          echo "| Política | Andon Cord para ERROR |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Publicar Artifact Semgrep
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-report
+          path: semgrep-report.json
+          retention-days: 14
+
+      - name: Andon Cord Semgrep - Bloquear ERROR
+        run: |
+          semgrep scan             --config=p/owasp-top-ten             --severity=ERROR             --error             devops-tp12/app devops-tp12/chart
+
+  # =========================================================================
   # FASE 2A: AUDITORÍA DE SEGURIDAD - ANDON CORD (HIGH/CRITICAL)
   # =========================================================================
+  gitleaks-andon-cord:
+    name: "Fase 2A: Gitleaks - Andon Cord (Secret Detection)"
+    runs-on: ubuntu-latest
+    needs: [build-and-package]
+    steps:
+      - name: Checkout del código (Historial completo para análisis)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Escaneo de Secretos con Gitleaks Action
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: false
+
+      - name: Resumen de Andon Cord en GitHub
+        if: always()
+        run: |
+          echo "### Auditoría de Secretos (Gitleaks) :key:" >> $GITHUB_STEP_SUMMARY
+          echo "| Evaluación | Tipo de Control | Acción en Pipeline |" >> $GITHUB_STEP_SUMMARY
+          echo "|------------|-----------------|--------------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Fuga de Secretos** | **Andon Cord Activo** | Bloquea el merge si se detectan credenciales |" >> $GITHUB_STEP_SUMMARY
+
+  gitleaks-audit-report:
+    name: "Fase 2B: Gitleaks - Reporte e Inspección (Artifacts)"
+    runs-on: ubuntu-latest
+    needs: [build-and-package, gitleaks-andon-cord]
+    if: always()
+    steps:
+      - name: Checkout del código (Historial completo)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalación de Gitleaks CLI
+        run: |
+          wget https://github.com/gitleaks/gitleaks/releases/download/v8.18.2/gitleaks_8.18.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.18.2_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Generar Reporte de Auditoría en JSON
+        run: |
+          gitleaks detect --source . --report-format json --report-path gitleaks-report.json || true
+
+      - name: Publicar Artifact de Auditoría de Secretos
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-fuga-secretos-gitleaks
+          path: gitleaks-report.json
+          retention-days: 14
+
+      - name: Publicar Resumen en $GITHUB_STEP_SUMMARY
+        run: |
+          echo "### Reporte de Inspección de Secretos (Gitleaks) :clipboard:" >> $GITHUB_STEP_SUMMARY
+          echo "El informe JSON detallado de auditoría de Git se ha adjuntado como **Artifact**." >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`json" >> $GITHUB_STEP_SUMMARY
+          head -n 30 gitleaks-report.json || echo "[]" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
   trivy-andon-cord:
     name: "Fase 2A: Trivy - Andon Cord (HIGH/CRITICAL)"
     runs-on: ubuntu-latest
@@ -152,7 +266,7 @@ jobs:
   deploy-k8s-helm:
     name: "Fase 3: Release & Deploy Helm K8s"
     runs-on: ubuntu-latest
-    needs: [build-and-package, trivy-andon-cord, trivy-audit-report]
+    needs: [build-and-package, semgrep-sast-scan, gitleaks-andon-cord, gitleaks-audit-report, trivy-andon-cord, trivy-audit-report]
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout del código
